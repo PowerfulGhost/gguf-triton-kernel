@@ -1,0 +1,9 @@
+.vscode/
+.devcontainer/
+__pycache__/
+
+
+dbg/
+doc/
+temp/
+ref/
