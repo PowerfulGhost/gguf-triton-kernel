@@ -9,4 +9,4 @@ def allclose(a, b, atol_ratio=0.01):
 
 
 if __name__ == "__main__":
-    a = torch.tensor
+    pass

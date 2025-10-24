@@ -5,7 +5,7 @@ sys.path.append("/workspaces/gguf-triton-kernel")
 
 import torch
 
-from utils.quantize import quantize_to_q8_0
+from utils.quantize.q8_0 import quantize_to_q8_0
 from utils.test_utils import allclose
 
 from kernels.mmq_q8_0 import mmq_q8_0
@@ -35,7 +35,7 @@ for M, N, K in mnk_list:
     #     print(f"{C_cpu=}")
     #     print(f"{C_triton=}")
 
-    if allclose(C_cpu, C_triton.cpu(), 0.1):
+    if allclose(C_cpu, C_triton.cpu(), 0.01):
         print("PASS")
     else:
         print("FAILED")
