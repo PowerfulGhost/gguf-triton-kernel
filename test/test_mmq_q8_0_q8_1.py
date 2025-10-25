@@ -12,7 +12,7 @@ from utils.quantize.q8_1 import quantize_to_q8_1
 from utils.test_utils import allclose
 
 from kernels.mmq_q8_0_q8_1 import mmq_q8_0_q8_1
-from kernels.cpu_impls.mmq_q8_0_cpu import mmq_q8_0_q8_1_cpu
+from kernels.cpu_impls.mmq_q8_0_q8_1_cpu import mmq_q8_0_q8_1_cpu
 
 mnk_list = []
 for m_pow in range(0, 6, 2):

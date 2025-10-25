@@ -1,38 +1,57 @@
+"""
+typedef struct
+{
+    union
+    {
+        struct
+        {
+            ggml_half d;    // super-block scale for quantized scales
+            ggml_half dmin; // super-block scale for quantized mins
+        };
+        ggml_half2 dm;
+    };
+    uint8_t scales[K_SCALE_SIZE]; // scales and mins, quantized with 6 bits
+    uint8_t qs[QK_K / 2];         // 4--bit quants
+} block_q4_K;
+"""
+
 import torch
 import triton
 import triton.language as tl
 
-# Q8_0量化常量
-QK8_0 = 32  # 每个量化块中的元素数量
+QK_K = 256
+K_SCALE_SIZE = 12
+Q8_K = 32
 
 
 @triton.jit
-def vec_dot_q8_0_q8_0(A_weights: tl.tensor, A_scale: tl.tensor, B_weights: tl.tensor, B_scale: tl.tensor):
-    """
-    计算两个Q8_0量化块的点积
-    """
-    return A_scale[None, :] * B_scale[:, None] * tl.dot(B_weights, A_weights.T)
-
-
-@triton.jit
-def mul_mat_q8_0_triton(
+def mul_mat_q4_k_q8_1_triton(
     A_ptr: tl.tensor,
     B_ptr: tl.tensor,
     C_ptr: tl.tensor,
     M,  # A 的列数
     N,  # B 的列数
     K,  # A 和 B 的行数
-    qblock_num_in_K_direction: int,  # K 方向的量化块数量
+    qblock_num_in_K_direction_A: int,  # A 在 K 方向的量化块数量
+    qblock_num_in_K_direction_B: int,  # B 在 K 方向的量化块数量
+    q4_k_block_size_bytes: tl.constexpr,
+    q8_1_block_size_bytes: tl.constexpr,
+    QK_K: tl.constexpr,
+    K_SCALE_SIZE: tl.constexpr,
+    Q8_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
     """
-    Q8_0量化矩阵乘法 Triton实现
+    Q4_K @ Q8_1
     
-    计算 C = (A @ B^T)^T
+    C = (A @ B.T).T
+
+    A: Q4_K
+    B: Q8_1
     """
-    block_size_bytes = 34
-    bytes_in_K_direction = block_size_bytes * qblock_num_in_K_direction
+    bytes_in_K_direction_A = q4_k_block_size_bytes * qblock_num_in_K_direction_A
+    bytes_in_K_direction_B = q8_1_block_size_bytes * qblock_num_in_K_direction_B
 
     # 当前块的索引
     pid_m = tl.program_id(0)
@@ -136,6 +155,6 @@ def mmq_q4_k(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> torch.
     # 启动Triton内核
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']))
 
-    mul_mat_q8_0_triton[grid](A, B, C, M, N, K, qblock_num_in_K_direction, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    mul_mat_q4_k_q8_1_triton[grid](A, B, C, M, N, K, qblock_num_in_K_direction, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
     return C
