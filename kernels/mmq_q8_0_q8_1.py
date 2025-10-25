@@ -15,7 +15,7 @@ def vec_dot_q8_0_q8_0(A_weights: tl.tensor, A_scale: tl.tensor, B_weights: tl.te
 
 
 @triton.jit
-def mul_mat_q8_0_triton(
+def _mmq_q8_0_q8_1_triton(
     A_ptr: tl.tensor,
     B_ptr: tl.tensor,
     C_ptr: tl.tensor,
@@ -23,16 +23,20 @@ def mul_mat_q8_0_triton(
     N,  # B 的列数
     K,  # A 和 B 的行数
     qblock_num_in_K_direction: int,  # K 方向的量化块数量
+    q8_0_block_size_bytes: tl.constexpr,
+    q8_1_block_size_bytes: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
     """
-    Q8_0量化矩阵乘法 Triton实现
-    
-    计算 C = (A @ B^T)^T
+    C = (A @ B^T)^T
+
+    A: Q8_0
+    B: Q8_1
+    C: float16
     """
-    block_size_bytes = 34
-    bytes_in_K_direction = block_size_bytes * qblock_num_in_K_direction
+    bytes_in_K_direction_A = q8_0_block_size_bytes * qblock_num_in_K_direction
+    bytes_in_K_direction_B = q8_1_block_size_bytes * qblock_num_in_K_direction
 
     # 当前块的索引
     pid_m = tl.program_id(0)
@@ -59,7 +63,7 @@ def mul_mat_q8_0_triton(
         # 从 A 中读取量化块
         # row = [0, 1], col = [0, 1]
         # A -> col
-        A_qblock_idx = (cols * bytes_in_K_direction) + qblock_idx_k * block_size_bytes
+        A_qblock_idx = (cols * bytes_in_K_direction_A) + qblock_idx_k * q8_0_block_size_bytes
         # 缩放因子
         A_scale_lower_byte_idx = A_qblock_idx
         A_scale_higher_byte_idx = A_qblock_idx + 1
@@ -69,12 +73,12 @@ def mul_mat_q8_0_triton(
             A_scale_higher_byte.cast(tl.uint8, bitcast=True).cast(tl.uint16) << 8 | \
             A_scale_lower_byte.cast(tl.uint8, bitcast=True).cast(tl.uint16)
         ).cast(tl.float16, bitcast=True).to(tl.float32)
-        # 权重
+        # 量化后权重
         A_weight_idx = (A_qblock_idx + 2)[:, None] + tl.arange(0, 32)
         A_weights = tl.load(A_ptr + A_weight_idx, mask=A_mask[:, None], other=0)
 
         # 从 B 中读取量化块
-        B_qblock_idx = (rows * bytes_in_K_direction) + qblock_idx_k * block_size_bytes
+        B_qblock_idx = (rows * bytes_in_K_direction_B) + qblock_idx_k * q8_1_block_size_bytes
         # 缩放因子
         B_scale_lower_byte_idx = B_qblock_idx
         B_scale_higher_byte_idx = B_qblock_idx + 1
@@ -84,20 +88,13 @@ def mul_mat_q8_0_triton(
             B_scale_higher_byte.cast(tl.uint8, bitcast=True).cast(tl.uint16) << 8 | \
             B_scale_lower_byte.cast(tl.uint8, bitcast=True).cast(tl.uint16)
         ).cast(tl.float16, bitcast=True).to(tl.float32)
-        # 权重
-        B_weight_idx = (B_qblock_idx + 2)[:, None] + tl.arange(0, 32)
+        # 量化后权重
+        B_weight_idx = (B_qblock_idx + 4)[:, None] + tl.arange(0, 32)  # +4 因为q8_1块内开头有4字节（d和s）
         B_weights = tl.load(B_ptr + B_weight_idx, mask=B_mask[:, None], other=0)
 
-        # 计算这两个量化块的点积
-        dot_result = vec_dot_q8_0_q8_0(
-            A_weights,
-            A_scale,
-            B_weights,
-            B_scale,
-        ).to(tl.float16).reshape(BLOCK_SIZE_M, BLOCK_SIZE_N)
-
-        # 累加到结果中
-        acc += dot_result
+        # 计算点积并累加到结果中
+        # c = A_scale * B_scale * sum( q_a_i * q_b_i ) for i in [0, 32)
+        acc += (A_scale[None, :] * B_scale[:, None] * tl.dot(B_weights, A_weights.T)).to(tl.float16)
 
     # ===== 存储结果 =====
     out_ptrs = C_ptr + rows[:, None] * M + cols[None, :]
@@ -106,13 +103,13 @@ def mul_mat_q8_0_triton(
 
 
 # 辅助函数：启动Triton内核
-def mmq_q8_0(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> torch.Tensor:
+def mmq_q8_0_q8_1(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> torch.Tensor:
     """
-    执行Q8_0-Q8_0量化矩阵乘法: out = (A @ B.T).T
+    执行Q8_0-Q8_1量化矩阵乘法: out = (A @ B.T).T
     
     Args:
         A: Q8_0 量化格式
-        B: Q8_0 量化格式
+        B: Q8_1 量化格式
         M: A 的行数
         N: B 的行数
         K: A 和 B 的列数 (应相等)
@@ -136,6 +133,6 @@ def mmq_q8_0(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> torch.
     # 启动Triton内核
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']))
 
-    mul_mat_q8_0_triton[grid](A, B, C, M, N, K, qblock_num_in_K_direction, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    _mmq_q8_0_q8_1_triton[grid](A, B, C, M, N, K, qblock_num_in_K_direction, 34, 36, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
     return C

@@ -2,14 +2,14 @@
 import torch
 
 
-def mmq_q8_0_cpu(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int):
+def mmq_q8_0_q8_1_cpu(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int):
     """
-    q8_0量化矩阵相乘的cpu实现
+    Q8_0-Q8_1 量化矩阵相乘的cpu实现
     C = (A @ B.T).T
 
     Args:
-        A: 矩阵A，int8
-        B: 矩阵B，int8
+        A: 矩阵A，int8，Q8_0量化
+        B: 矩阵B，int8，Q8_1量化
         M: 矩阵A的行数，int
         N: 矩阵B的行数，int
         K: 矩阵A和矩阵B的列数（应相等），int
@@ -17,33 +17,36 @@ def mmq_q8_0_cpu(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int):
     Returns:
         矩阵相乘结果，float16
     """
+
+    q8_0_block_size_bytes = 34
+    q8_1_block_size_bytes = 36
+
     # 确保A和B的元素数量正确
     assert K % 32 == 0
     assert A.dtype == torch.int8
     assert B.dtype == torch.int8
-    assert A.numel() == M * K / 32 * 34
-    assert B.numel() == N * K / 32 * 34
+    assert A.numel() == M * K / 32 * q8_0_block_size_bytes
+    assert B.numel() == N * K / 32 * q8_1_block_size_bytes
 
     A = A.cpu()
     B = B.cpu()
     C = torch.zeros((M, N), dtype=torch.float16)
 
     quant_block_per_row = K // 32
-    quant_block_size_bytes = 34
 
     for m in range(M):
         for n in range(N):
             for quant_block_idx in range(K // 32):
                 # 从A中加载量化块
-                ptr_A = (quant_block_per_row * m + quant_block_idx) * quant_block_size_bytes
-                quant_block_A = A[ptr_A:ptr_A + quant_block_size_bytes]
+                ptr_A = (quant_block_per_row * m + quant_block_idx) * q8_0_block_size_bytes
+                quant_block_A = A[ptr_A:ptr_A + q8_0_block_size_bytes]
                 scale_A = quant_block_A[:2].view(torch.float16)
                 quant_weights_A = quant_block_A[2:]
                 # 从B中加载量化块
-                ptr_B = (quant_block_per_row * n + quant_block_idx) * quant_block_size_bytes
-                quant_block_B = B[ptr_B:ptr_B + quant_block_size_bytes]
+                ptr_B = (quant_block_per_row * n + quant_block_idx) * q8_1_block_size_bytes
+                quant_block_B = B[ptr_B:ptr_B + q8_1_block_size_bytes]
                 scale_B = quant_block_B[:2].view(torch.float16)
-                quant_weights_B = quant_block_B[2:]
+                quant_weights_B = quant_block_B[4:]
                 # 计算量化块相乘
                 int_dot = torch.dot(quant_weights_A.to(torch.int32), quant_weights_B.to(torch.int32))
                 result = scale_A * scale_B * int_dot
@@ -55,10 +58,15 @@ def mmq_q8_0_cpu(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int):
 
 # %%
 if __name__ == "__main__":
+    import os
     import sys
-    sys.path.append("/workspaces/gguf-triton-kernel")
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(os.path.dirname(current_dir))
+    sys.path.append(root_dir)
 
-    from utils.quantize import quantize_to_q8_0
+    from utils.quantize.q8_0 import quantize_to_q8_0
+    from utils.quantize.q8_1 import quantize_to_q8_1
+
     from matplotlib import pyplot as plt
 
     def plot_hot_graph(title: str, tensor: torch.Tensor, vmin, vmax):
@@ -99,11 +107,11 @@ if __name__ == "__main__":
 
                 A = torch.randn((M, K), dtype=torch.float16)
                 B = torch.randn((N, K), dtype=torch.float16)
-                C = A @ B.T
+                C = (A @ B.T).T
 
                 quant_A = quantize_to_q8_0(A)
-                quant_B = quantize_to_q8_0(B)
-                C_need_test = mmq_q8_0_cpu(quant_A, quant_B, M, N, K)
+                quant_B = quantize_to_q8_1(B)
+                C_need_test = mmq_q8_0_q8_1_cpu(quant_A, quant_B, M, N, K)
 
                 noise = C - C_need_test
 
