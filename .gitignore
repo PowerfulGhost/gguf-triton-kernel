@@ -7,5 +7,6 @@ dbg/
 doc/
 temp/
 ref/
+deps/
 
 *.so
