@@ -8,5 +8,6 @@ doc/
 temp/
 ref/
 deps/
+ir/
 
 *.so

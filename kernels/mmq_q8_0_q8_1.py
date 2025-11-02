@@ -7,11 +7,9 @@ QK8_0 = 32  # 每个量化块中的元素数量
 
 
 @triton.jit
-def vec_dot_q8_0_q8_0(A_weights: tl.tensor, A_scale: tl.tensor, B_weights: tl.tensor, B_scale: tl.tensor):
-    """
-    计算两个Q8_0量化块的点积
-    """
-    return A_scale[None, :] * B_scale[:, None] * tl.dot(B_weights, A_weights.T)
+def _load_2bytes_as_fp16(ptr, mask):
+    _ptr = ptr.to(tl.pointer_type(tl.float16))
+    return tl.load(_ptr, mask, 0)
 
 
 @triton.jit
@@ -19,14 +17,15 @@ def _mmq_q8_0_q8_1_triton(
     A_ptr: tl.tensor,
     B_ptr: tl.tensor,
     C_ptr: tl.tensor,
-    M,  # A 的列数
-    N,  # B 的列数
-    K,  # A 和 B 的行数
+    M: int,  # A 的列数
+    N: int,  # B 的列数
+    K: int,  # A 和 B 的行数
     qblock_num_in_K_direction: int,  # K 方向的量化块数量
-    q8_0_block_size_bytes: tl.constexpr,
-    q8_1_block_size_bytes: tl.constexpr,
+    Q8_0_SIZE: tl.constexpr,
+    Q8_1_SIZE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
 ):
     """
     C = (A @ B^T)^T
@@ -34,71 +33,73 @@ def _mmq_q8_0_q8_1_triton(
     A: Q8_0
     B: Q8_1
     C: float16
-    """
-    bytes_in_K_direction_A = q8_0_block_size_bytes * qblock_num_in_K_direction
-    bytes_in_K_direction_B = q8_1_block_size_bytes * qblock_num_in_K_direction
 
+    维度    元素          size
+    0(M/N)  A或B的一行    M或N
+    1(K)    A或B的一块    qblock_num_in_K_direction_A
+    2(Q)    qs           32
+    """
     # 当前块的索引
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
     # 计算块的起始行和列
-    row_start = pid_n * BLOCK_SIZE_M
-    col_start = pid_m * BLOCK_SIZE_N
+    col_start = pid_m * BLOCK_SIZE_M
+    row_start = pid_n * BLOCK_SIZE_N
 
     # 创建块的行和列索引
-    rows = row_start + tl.arange(0, BLOCK_SIZE_M)
-    cols = col_start + tl.arange(0, BLOCK_SIZE_N)
+    cols = col_start + tl.arange(0, BLOCK_SIZE_M)  # (M,)
+    rows = row_start + tl.arange(0, BLOCK_SIZE_N)  # (N,)
+    qblks = 0 + tl.arange(0, BLOCK_SIZE_K)  # (K1,)
 
     # 创建掩码以处理边界情况
-    A_mask = cols < M
-    B_mask = rows < N
+    K_mask = qblks < qblock_num_in_K_direction
+    A_mask = (cols < M)[:, None] & K_mask
+    B_mask = (rows < N)[:, None] & K_mask
 
-    # 初始化累加器
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float16)
+    acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), tl.float32)
 
-    # 沿K方向遍历所有量化块
-    # TODO: 是否可以不用遍历，而用tl.arange？
-    for qblock_idx_k in range(0, qblock_num_in_K_direction):
-        # 从 A 中读取量化块
-        # row = [0, 1], col = [0, 1]
-        # A -> col
-        A_qblock_idx = (cols * bytes_in_K_direction_A) + qblock_idx_k * q8_0_block_size_bytes
-        # 缩放因子
-        A_scale_lower_byte_idx = A_qblock_idx
-        A_scale_higher_byte_idx = A_qblock_idx + 1
-        A_scale_lower_byte = tl.load(A_ptr + A_scale_lower_byte_idx, mask=A_mask, other=60)  # 低八位60，高八位0，组合起来是float16的1.0
-        A_scale_higher_byte = tl.load(A_ptr + A_scale_higher_byte_idx, mask=A_mask, other=0)
-        A_scale = (
-            A_scale_higher_byte.cast(tl.uint8, bitcast=True).cast(tl.uint16) << 8 | \
-            A_scale_lower_byte.cast(tl.uint8, bitcast=True).cast(tl.uint16)
-        ).cast(tl.float16, bitcast=True).to(tl.float32)
-        # 量化后权重
-        A_weight_idx = (A_qblock_idx + 2)[:, None] + tl.arange(0, 32)
-        A_weights = tl.load(A_ptr + A_weight_idx, mask=A_mask[:, None], other=0)
+    for k_stride_idx in tl.range(tl.cdiv(qblock_num_in_K_direction, BLOCK_SIZE_K)):
+        # 加载A
+        qblock_A_idx = qblock_num_in_K_direction * cols.reshape(BLOCK_SIZE_M, 1) + \
+            BLOCK_SIZE_K * k_stride_idx + \
+            tl.arange(0, BLOCK_SIZE_K)
+        qblock_A_start = qblock_A_idx * Q8_0_SIZE
+        # scale
+        A_scale_start = qblock_A_start.reshape(BLOCK_SIZE_M, BLOCK_SIZE_K)
+        A_scale = _load_2bytes_as_fp16(A_ptr + A_scale_start, A_mask.reshape(BLOCK_SIZE_M, BLOCK_SIZE_K))  # (M, K)
+        A_scale = A_scale.cast(tl.float32)
+        # qs
+        A_qs_start = qblock_A_start.reshape(BLOCK_SIZE_M, BLOCK_SIZE_K, 1) + 2 + tl.arange(0, 32)
+        A_qs = tl.load(A_ptr + A_qs_start, mask=A_mask.reshape(BLOCK_SIZE_M, BLOCK_SIZE_K, 1), other=0)  # (M, K, Q)
 
-        # 从 B 中读取量化块
-        B_qblock_idx = (rows * bytes_in_K_direction_B) + qblock_idx_k * q8_1_block_size_bytes
-        # 缩放因子
-        B_scale_lower_byte_idx = B_qblock_idx
-        B_scale_higher_byte_idx = B_qblock_idx + 1
-        B_scale_lower_byte = tl.load(B_ptr + B_scale_lower_byte_idx, mask=B_mask, other=60)  # 低八位60，高八位0，组合起来是float16的1.0
-        B_scale_higher_byte = tl.load(B_ptr + B_scale_higher_byte_idx, mask=B_mask, other=0)
-        B_scale = (
-            B_scale_higher_byte.cast(tl.uint8, bitcast=True).cast(tl.uint16) << 8 | \
-            B_scale_lower_byte.cast(tl.uint8, bitcast=True).cast(tl.uint16)
-        ).cast(tl.float16, bitcast=True).to(tl.float32)
-        # 量化后权重
-        B_weight_idx = (B_qblock_idx + 4)[:, None] + tl.arange(0, 32)  # +4 因为q8_1块内开头有4字节（d和s）
-        B_weights = tl.load(B_ptr + B_weight_idx, mask=B_mask[:, None], other=0)
+        # 加载B
+        qblock_B_idx = \
+            qblock_num_in_K_direction * rows.reshape(BLOCK_SIZE_N, 1) + \
+            BLOCK_SIZE_K * k_stride_idx + \
+            tl.arange(0, BLOCK_SIZE_K)
+        qblock_B_start = qblock_B_idx * Q8_1_SIZE
+        # scale
+        B_scale_start = qblock_B_start.reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
+        B_scale = _load_2bytes_as_fp16(B_ptr + B_scale_start, B_mask.reshape(BLOCK_SIZE_N, BLOCK_SIZE_K))  # (N, K)
+        B_scale = B_scale.cast(tl.float32)
+        # qs
+        B_qs_start = qblock_B_start.reshape(BLOCK_SIZE_N, BLOCK_SIZE_K, 1) + 4 + tl.arange(0, 32)
+        B_qs = tl.load(B_ptr + B_qs_start, mask=B_mask.reshape(BLOCK_SIZE_N, BLOCK_SIZE_K, 1), other=0)  # (N, K, Q)
 
-        # 计算点积并累加到结果中
-        # c = A_scale * B_scale * sum( q_a_i * q_b_i ) for i in [0, 32)
-        acc += (A_scale[None, :] * B_scale[:, None] * tl.dot(B_weights, A_weights.T)).to(tl.float16)
+        # dot
+        a = A_qs.trans(1, 2, 0)  # (K, Q, M)
+        b = B_qs.trans(1, 0, 2)  # (K, N, Q)
+        R = tl.dot(b, a)  # (K, N, M)
+        R = R.trans(1, 2, 0)  # (N, M, K)
+        _res = A_scale.reshape(1, BLOCK_SIZE_M, BLOCK_SIZE_K) * B_scale.reshape(BLOCK_SIZE_N, 1, BLOCK_SIZE_K) * R
+        res = tl.sum(_res, 2)
+
+        acc += res
 
     # ===== 存储结果 =====
-    out_ptrs = C_ptr + rows[:, None] * M + cols[None, :]
-    out_mask = A_mask & B_mask[:, None]
+    out_ptrs = C_ptr + M * rows.reshape(BLOCK_SIZE_N, 1) + cols.reshape(1, BLOCK_SIZE_M)
+    out_mask = (rows < N)[:, None] & (cols < M)
     tl.store(out_ptrs, acc, mask=out_mask)
 
 
@@ -113,7 +114,7 @@ def mmq_q8_0_q8_1(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> t
         M: A 的行数
         N: B 的行数
         K: A 和 B 的列数 (应相等)
-        
+ 
     Returns:
         输出矩阵 (float16)
     """
@@ -122,6 +123,7 @@ def mmq_q8_0_q8_1(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> t
     # 每个 program 负责计算 BLOCK_SIZE_M * BLOCK_SIZE_N 区域大小的输出
     BLOCK_SIZE_M = 2
     BLOCK_SIZE_N = 2
+    BLOCK_SIZE_K = 8
 
     # K方向的量化块数量
     assert (K % 32 == 0)
@@ -133,6 +135,6 @@ def mmq_q8_0_q8_1(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> t
     # 启动Triton内核
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']))
 
-    _mmq_q8_0_q8_1_triton[grid](A, B, C, M, N, K, qblock_num_in_K_direction, 34, 36, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    _mmq_q8_0_q8_1_triton[grid](A, B, C, M, N, K, qblock_num_in_K_direction, 34, 36, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
 
     return C
