@@ -21,6 +21,13 @@ import triton.language as tl
 
 
 @triton.jit
+def round_to_nearest_int(fval):
+    val = fval + 12582912.0
+    ival = val.cast(tl.int32, bitcast=True)
+    return (ival & 0x007fffff) - 0x00400000
+
+
+@triton.jit
 def _load_q4_k_scales_mins(qblock_start_ptr, qblock_mask, subblk_idx):
     """
     qblock_start_ptr: (M, K1)
@@ -121,7 +128,7 @@ def mul_mat_q4_k_q8_1_triton(
     Q8_1_BLOCK_SIZE: tl.constexpr,
     Q4_K_SUBBLK_NUM: tl.constexpr,
     QK_K: tl.constexpr,
-    Q8_K: tl.constexpr,
+    QK8_1: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K1: tl.constexpr,
@@ -186,19 +193,25 @@ def mul_mat_q4_k_q8_1_triton(
             A_mins = A_dmin.expand_dims(2) * A_mins_int8  # (M, K1, K2)
             A_qs = _load_q4_k_qs(A_qblock_ptr, M_K1_mask, K2_idx)  # (M, K1, K2, K3)
 
-            # 加载B_scales, B_sc_qs_prow, B_qs
-            B_qblock_idx = ((qblock_num_in_K_direction_B * N_idx.expand_dims(1)) + 8 * BLOCK_SIZE_K1 * K1_idx).expand_dims(2) + K2_idx
-            B_qblock_start = Q8_1_BLOCK_SIZE * B_qblock_idx
-            B_qblock_ptr = B_ptr + B_qblock_start  # (M, K1, K2)
+            # 加载B
+            B_block_num_per_A_qblock = tl.constexpr(8)
+            B_block_num_in_K_direction = qblock_num_in_K_direction_A * B_block_num_per_A_qblock
+            B_block_idx = ((B_block_num_in_K_direction * N_idx.expand_dims(1)) + B_block_num_per_A_qblock * BLOCK_SIZE_K1 * K1_idx).expand_dims(2) + K2_idx
+            B_block_start = QK8_1 * B_block_idx  # (N, K1, K2)
+            B_weight_idx = B_block_start.expand_dims(3) + tl.arange(0, QK8_1)
+            B = tl.load(B_ptr + B_weight_idx, mask=N_K1_K2_mask.expand_dims(3), other=0)  # (N, K1, K2, K3)
 
-            B_scales = tl.load(B_qblock_ptr.to(tl.pointer_type(tl.float16)), mask=N_K1_K2_mask, other=0)  # (N, K1, K2)
-            B_sc_qs_prod = tl.load((B_qblock_ptr + 2).to(tl.pointer_type(tl.float16)), mask=N_K1_K2_mask, other=0)  # (N, K1, K2)
-            B_qs_ptr = (B_qblock_ptr + 4).expand_dims(3) + tl.arange(0, Q8_K)
-            B_qs = tl.load(B_qs_ptr, mask=N_K1_K2_mask.expand_dims(3), other=0)  # (N, K1, K2, K3)
+            # 量化B
+            B_max = tl.max(tl.abs(B), 3)  # (N, K1, K2)
+            B_scales = B_max / 127.0
+            B_iscales = 127.0 / B_max
+            B_qs = round_to_nearest_int(B * B_iscales.expand_dims(3)).to(tl.int8)  # (N, K1, K2, K3)
+            # B_sum = tl.sum(B, 3)  # (N, K1, K2)
+            B_sum = B_scales * tl.sum(B_qs, 3)
 
             # dot
             a = A_qs.trans(1, 2, 3, 0).reshape(BLOCK_SIZE_K1 * BLOCK_SIZE_K2, QK_K // Q4_K_SUBBLK_NUM, BLOCK_SIZE_M)  # (K1*K2, K3, M)
-            b = B_qs.trans(1, 2, 0, 3).reshape(BLOCK_SIZE_K1 * BLOCK_SIZE_K2, BLOCK_SIZE_N, Q8_K)  # (K1*K2, N, K3)
+            b = B_qs.trans(1, 2, 0, 3).reshape(BLOCK_SIZE_K1 * BLOCK_SIZE_K2, BLOCK_SIZE_N, QK8_1)  # (K1*K2, N, K3)
             R = tl.dot(b, a).trans(1, 2, 0).reshape(BLOCK_SIZE_N, BLOCK_SIZE_M, BLOCK_SIZE_K1, BLOCK_SIZE_K2)  # (N, M, K1, K2)
 
             # res = alpha - beta
@@ -206,9 +219,9 @@ def mul_mat_q4_k_q8_1_triton(
             a_sc = A_scales.reshape(1, BLOCK_SIZE_M, BLOCK_SIZE_K1, BLOCK_SIZE_K2)
             a_m = A_mins.reshape(1, BLOCK_SIZE_M, BLOCK_SIZE_K1, BLOCK_SIZE_K2)
             b_sc = B_scales.reshape(BLOCK_SIZE_N, 1, BLOCK_SIZE_K1, BLOCK_SIZE_K2)
-            b_sqp = B_sc_qs_prod.reshape(BLOCK_SIZE_N, 1, BLOCK_SIZE_K1, BLOCK_SIZE_K2)
+            b_sum = B_sum.reshape(BLOCK_SIZE_N, 1, BLOCK_SIZE_K1, BLOCK_SIZE_K2)
 
-            res = a_sc * b_sc * R - a_m * b_sqp
+            res = a_sc * b_sc * R - a_m * b_sum
             res = res.reshape(BLOCK_SIZE_N, BLOCK_SIZE_M, BLOCK_SIZE_K1 * BLOCK_SIZE_K2)
 
             acc += tl.sum(res, 2)
@@ -223,7 +236,7 @@ Q4_K_BLOCK_SIZE = 144  # bytes
 Q8_1_BLOCK_SIZE = 36  # bytes
 Q4_K_SUBBLK_NUM = 8
 QK_K = 256
-Q8_K = 32
+QK8_1 = 32
 
 
 # 辅助函数：启动Triton内核
@@ -273,7 +286,7 @@ def mmq_q4_k_q8_1(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> t
         Q8_1_BLOCK_SIZE=Q8_1_BLOCK_SIZE,
         Q4_K_SUBBLK_NUM=Q4_K_SUBBLK_NUM,
         QK_K=QK_K,
-        Q8_K=Q8_K,
+        QK8_1=QK8_1,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K1=BLOCK_SIZE_K1,

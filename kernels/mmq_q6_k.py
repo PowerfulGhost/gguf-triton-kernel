@@ -19,6 +19,13 @@ import triton.language as tl
 
 
 @triton.jit
+def round_to_nearest_int(fval):
+    val = fval + 12582912.0
+    ival = val.cast(tl.int32, bitcast=True)
+    return (ival & 0x007fffff) - 0x00400000
+
+
+@triton.jit
 def _load_q6_k_subblk_weights(qblock_start_ptr, qblock_mask, subblk_idx):
     """
     idx in [0~8)
@@ -70,12 +77,11 @@ def mul_mat_q6_k_q8_1_triton(
     N: int,  # B 的列数
     K: int,  # A 和 B 的行数
     qblock_num_in_K_direction_A: int,  # A 在 K 方向的量化块数量
-    qblock_num_in_K_direction_B: int,  # B 在 K 方向的量化块数量
     Q6_K_BLOCK_SIZE: tl.constexpr,
     Q8_1_BLOCK_SIZE: tl.constexpr,
     Q6_K_SUBBLK_NUM: tl.constexpr,
     QK_K: tl.constexpr,
-    Q8_K: tl.constexpr,
+    QK8_1: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K1: tl.constexpr,
@@ -145,20 +151,22 @@ def mul_mat_q6_k_q8_1_triton(
             A_qs = _load_q6_k_subblk_weights(A_ptr + A_qblock_start, M_K1_mask, K2_idx)  # (M, K1, K2, K3)
 
             # 加载B
-            K2_idx_Q8_1 = (BLOCK_SIZE_K2 // 2) * k2_stride_idx + tl.arange(0, BLOCK_SIZE_K2 // 2)  # (K2/2,)
-            K2_mask_Q8_1 = K2_idx_Q8_1 < (QK_K / Q8_K)
+            K2_idx_B_block = (BLOCK_SIZE_K2 // 2) * k2_stride_idx + tl.arange(0, BLOCK_SIZE_K2 // 2)  # (K2/2,)
+            K2_mask_B_block = K2_idx_B_block < (QK_K / QK8_1)
             N_K1_mask = N_mask.reshape(BLOCK_SIZE_N, 1) & K1_mask
-            N_K1_K2_mask = N_K1_mask.reshape(BLOCK_SIZE_N, BLOCK_SIZE_K1, 1) & K2_mask_Q8_1  # (N, K1, K2/2)
-            B_qblock_idx = (qblock_num_in_K_direction_B * N_idx.reshape(BLOCK_SIZE_N, 1) + 8 * BLOCK_SIZE_K1 * K1_idx).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K1, 1) + K2_idx_Q8_1  # (N, K1, K2/2)
-            B_qblock_start = Q8_1_BLOCK_SIZE * B_qblock_idx  # (N, K1, K2/2)
+            N_K1_K2_mask = N_K1_mask.expand_dims(2) & K2_mask_B_block  # (N, K1, K2/2)
 
-            # 加载B_scale
-            B_scales_ptr = (B_ptr + B_qblock_start).to(tl.pointer_type(tl.float16))  # (N, K1, K2/2)
-            B_scales = tl.load(B_scales_ptr, N_K1_K2_mask, other=0).to(tl.float32)  # (N, K1, K2/2)
+            B_block_idx = (qblock_num_in_K_direction_A * 8 * N_idx.expand_dims(1) + 8 * BLOCK_SIZE_K1 * K1_idx).expand_dims(2) + K2_idx_B_block  # (N, K1, K2/2)
+            B_block_start = QK8_1 * B_block_idx  # (N, K1, K2/2)
+            B_weight_idx = B_block_start.expand_dims(3) + tl.arange(0, QK8_1)
 
-            # 加载B_qs
-            B_qs_ptr = (B_ptr + B_qblock_start + 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K1, BLOCK_SIZE_K2 // 2, 1) + tl.arange(0, Q8_K)  # (N, K1, K2/2, K3*2)
-            B_qs = tl.load(B_qs_ptr, N_K1_K2_mask.reshape(BLOCK_SIZE_N, BLOCK_SIZE_K1, BLOCK_SIZE_K2 // 2, 1), other=0)  # (N, K1, K2/2, K3*2)
+            B = tl.load(B_ptr + B_weight_idx, N_K1_K2_mask.expand_dims(3), 0)  # (N, K1, K2/2, K3*2)
+
+            # 量化B
+            B_max = tl.max(tl.abs(B), 3)  # (N, K1, K2/2)
+            B_scales = B_max / 127.0
+            B_iscales = 127.0 / B_max
+            B_qs = round_to_nearest_int(B * B_iscales.expand_dims(3)).to(tl.int8)  # (N, K1, K2/2, K3*2)
             B_qs = B_qs.reshape(BLOCK_SIZE_N, BLOCK_SIZE_K1, BLOCK_SIZE_K2 // 2, 2, 16)  # (N, K1, K2/2, 2, K3)
 
             # dot
@@ -182,7 +190,7 @@ def mul_mat_q6_k_q8_1_triton(
 
 QK_K = 256
 Q6_K_SUBBLK_NUM = 16
-Q8_K = 32
+QK8_1 = 32
 Q6_K_BLOCK_SIZE = 210  # bytes
 Q8_1_BLOCK_SIZE = 36  # bytes
 
@@ -190,11 +198,11 @@ Q8_1_BLOCK_SIZE = 36  # bytes
 # 辅助函数：启动Triton内核
 def mmq_q6_k_q8_1(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> torch.Tensor:
     """
-    执行Q6_K-Q8_1量化矩阵乘法: out = (A @ B.T).T
+    执行Q6_K-fp16量化矩阵乘法: out = (A @ B.T).T
     
     Args:
         A: Q6_K 量化格式
-        B: Q8_1 量化格式
+        B: fp16
         M: A 的行数
         N: B 的行数
         K: A 和 B 的列数 (应相等)
@@ -212,8 +220,7 @@ def mmq_q6_k_q8_1(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> t
     BLOCK_SIZE_K2 = 16
 
     # K方向的量化块数量
-    qblock_num_in_K_direction_A = K // 256
-    qblock_num_in_K_direction_B = K // 32
+    qblock_num_in_K_direction = K // 256
 
     # 创建输出张量
     C = torch.empty((N, M), device=A.device, dtype=torch.float16)
@@ -228,13 +235,12 @@ def mmq_q6_k_q8_1(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> t
         M,
         N,
         K,
-        qblock_num_in_K_direction_A,
-        qblock_num_in_K_direction_B,
+        qblock_num_in_K_direction,
         Q6_K_BLOCK_SIZE=Q6_K_BLOCK_SIZE,
         Q8_1_BLOCK_SIZE=Q8_1_BLOCK_SIZE,
         Q6_K_SUBBLK_NUM=Q6_K_SUBBLK_NUM,
         QK_K=QK_K,
-        Q8_K=Q8_K,
+        QK8_1=QK8_1,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K1=BLOCK_SIZE_K1,

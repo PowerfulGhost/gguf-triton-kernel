@@ -11,7 +11,7 @@ from utils.quantize.q4_k import quantize_to_q4_k
 from utils.quantize.q8_1 import quantize_to_q8_1
 from utils.test_utils import allclose
 
-from kernels.mmq_q4_k_q8_1 import mmq_q4_k_q8_1
+from kernels.mmq_q4_k import mmq_q4_k_q8_1
 from kernels.cpu_impls.mmq_q4_k_q8_1_cpu import mmq_q4_k_q8_1_cpu
 
 mnk_list = []
@@ -31,7 +31,7 @@ for M, N, K in mnk_list:
     quant_B = quantize_to_q8_1(float_B)
 
     C_cpu = mmq_q4_k_q8_1_cpu(quant_A, quant_B, M, N, K)
-    C_triton = mmq_q4_k_q8_1(quant_A.to("cuda:0"), quant_B.to("cuda:0"), M, N, K)
+    C_triton = mmq_q4_k_q8_1(quant_A.to("cuda:0"), float_B.to("cuda:0"), M, N, K)
 
     # if M==1 and N==4 and K==32:
     #     print(f"{C_cpu=}")
