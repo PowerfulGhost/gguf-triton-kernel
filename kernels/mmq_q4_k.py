@@ -115,17 +115,14 @@ def _load_q4_k_qs(qblock_start_ptr, qblock_mask, subblk_idx):
 
 
 @triton.jit
-def mul_mat_q4_k_q8_1_triton(
+def mul_mat_q4_k_triton(
     A_ptr: tl.tensor,
     B_ptr: tl.tensor,
     C_ptr: tl.tensor,
     M: int,  # A 的列数
     N: int,  # B 的列数
-    K: int,  # A 和 B 的行数
-    qblock_num_in_K_direction_A: int,  # A 在 K 方向的量化块数量
-    qblock_num_in_K_direction_B: int,  # B 在 K 方向的量化块数量
+    A_qblock_num_in_K_direction: int,  # A 在 K 方向的量化块数量
     Q4_K_BLOCK_SIZE: tl.constexpr,
-    Q8_1_BLOCK_SIZE: tl.constexpr,
     Q4_K_SUBBLK_NUM: tl.constexpr,
     QK_K: tl.constexpr,
     QK8_1: tl.constexpr,
@@ -135,12 +132,12 @@ def mul_mat_q4_k_q8_1_triton(
     BLOCK_SIZE_K2: tl.constexpr,
 ):
     """
-    Q4_K @ Q8_1
+    Q4_K @ fp16
     
     C = (A @ B.T).T
 
     A: Q4_K
-    B: Q8_1
+    B: fp16
 
     维度     元素                   size
     0(M/N)  A或B的一行              M或N
@@ -167,13 +164,13 @@ def mul_mat_q4_k_q8_1_triton(
     # 初始化累加器
     acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
 
-    for k1_stride_idx in tl.range(qblock_num_in_K_direction_A // BLOCK_SIZE_K1):
+    for k1_stride_idx in tl.range(A_qblock_num_in_K_direction // BLOCK_SIZE_K1):
         K1_idx = tl.arange(0, BLOCK_SIZE_K1) + BLOCK_SIZE_K1 * k1_stride_idx  # (K1,)
-        K1_mask = K1_idx < qblock_num_in_K_direction_A
+        K1_mask = K1_idx < A_qblock_num_in_K_direction
         M_K1_mask = M_mask.expand_dims(1) & K1_mask
         N_K1_mask = N_mask.expand_dims(1) & K1_mask
 
-        A_qblock_idx = qblock_num_in_K_direction_A * M_idx.expand_dims(1) + K1_idx
+        A_qblock_idx = A_qblock_num_in_K_direction * M_idx.expand_dims(1) + K1_idx
         A_qblock_start = Q4_K_BLOCK_SIZE * A_qblock_idx
         A_qblock_ptr = A_ptr + A_qblock_start  # (M, K1)
 
@@ -195,7 +192,7 @@ def mul_mat_q4_k_q8_1_triton(
 
             # 加载B
             B_block_num_per_A_qblock = tl.constexpr(8)
-            B_block_num_in_K_direction = qblock_num_in_K_direction_A * B_block_num_per_A_qblock
+            B_block_num_in_K_direction = A_qblock_num_in_K_direction * B_block_num_per_A_qblock
             B_block_idx = ((B_block_num_in_K_direction * N_idx.expand_dims(1)) + B_block_num_per_A_qblock * BLOCK_SIZE_K1 * K1_idx).expand_dims(2) + K2_idx
             B_block_start = QK8_1 * B_block_idx  # (N, K1, K2)
             B_weight_idx = B_block_start.expand_dims(3) + tl.arange(0, QK8_1)
@@ -240,13 +237,13 @@ QK8_1 = 32
 
 
 # 辅助函数：启动Triton内核
-def mmq_q4_k_q8_1(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> torch.Tensor:
+def mmq_q4_k(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> torch.Tensor:
     """
-    执行Q4_K-Q8_1量化矩阵乘法: out = (A @ B.T).T
+    执行Q4_K-fp16量化矩阵乘法: out = (A @ B.T).T
     
     Args:
         A: Q4_K 量化格式
-        B: Q8_1 量化格式
+        B: fp16
         M: A 的行数
         N: B 的行数
         K: A 和 B 的列数 (应相等)
@@ -264,8 +261,7 @@ def mmq_q4_k_q8_1(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> t
 
     # K方向的量化块数量
     assert (K % 256 == 0)
-    qblock_num_in_K_direction_A = K // 256
-    qblock_num_in_K_direction_B = K // 32
+    A_qblock_num_in_K_direction = K // 256
 
     # 创建输出张量
     C = torch.empty((N, M), device=A.device, dtype=torch.float16)
@@ -273,17 +269,14 @@ def mmq_q4_k_q8_1(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> t
     # 启动Triton内核
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']))
 
-    mul_mat_q4_k_q8_1_triton[grid](
+    mul_mat_q4_k_triton[grid](
         A,
         B,
         C,
         M,
         N,
-        K,
-        qblock_num_in_K_direction_A=qblock_num_in_K_direction_A,
-        qblock_num_in_K_direction_B=qblock_num_in_K_direction_B,
+        A_qblock_num_in_K_direction=A_qblock_num_in_K_direction,
         Q4_K_BLOCK_SIZE=Q4_K_BLOCK_SIZE,
-        Q8_1_BLOCK_SIZE=Q8_1_BLOCK_SIZE,
         Q4_K_SUBBLK_NUM=Q4_K_SUBBLK_NUM,
         QK_K=QK_K,
         QK8_1=QK8_1,

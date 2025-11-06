@@ -17,10 +17,9 @@ def mmq_q8_0_triton(
     C_ptr: tl.tensor,
     M: int,  # A 的列数
     N: int,  # B 的列数
-    K: int,  # A 和 B 的行数
-    qblock_num_in_K_direction: int,  # K 方向的量化块数量
-    QK8_0: tl.constexpr,
+    A_qblock_num_in_K_direction: int,  # K 方向的量化块数量
     Q8_0_SIZE: tl.constexpr,
+    QK8_1: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -51,15 +50,15 @@ z
     qblks = 0 + tl.arange(0, BLOCK_SIZE_K)  # (K1,)
 
     # 创建掩码以处理边界情况
-    K_mask = qblks < qblock_num_in_K_direction
+    K_mask = qblks < A_qblock_num_in_K_direction
     A_mask = (M_idx < M).expand_dims(1) & K_mask  # (M, K1)
     B_mask = ((N_idx < N).expand_dims(1) & K_mask).expand_dims(2)  # (M, K1, Q)
 
     acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), tl.float32)
 
-    for k_stride_idx in tl.range(tl.cdiv(qblock_num_in_K_direction, BLOCK_SIZE_K)):
+    for k_stride_idx in tl.range(tl.cdiv(A_qblock_num_in_K_direction, BLOCK_SIZE_K)):
         # 加载A
-        A_qblock_idx = qblock_num_in_K_direction * M_idx.expand_dims(1) + BLOCK_SIZE_K * k_stride_idx + tl.arange(0, BLOCK_SIZE_K)
+        A_qblock_idx = A_qblock_num_in_K_direction * M_idx.expand_dims(1) + BLOCK_SIZE_K * k_stride_idx + tl.arange(0, BLOCK_SIZE_K)
         qblock_A_start = A_qblock_idx * Q8_0_SIZE
         # scale
         A_scale_start = qblock_A_start.reshape(BLOCK_SIZE_M, BLOCK_SIZE_K)
@@ -70,7 +69,7 @@ z
         A_qs = tl.load(A_ptr + A_qs_start, mask=A_mask.reshape(BLOCK_SIZE_M, BLOCK_SIZE_K, 1), other=0)  # (M, K, Q)
 
         # 加载B
-        B_idx = QK8_0 * (qblock_num_in_K_direction * N_idx.expand_dims(1) + BLOCK_SIZE_K * k_stride_idx + tl.arange(0, BLOCK_SIZE_K)).expand_dims(2) + tl.arange(0, QK8_0)  # (N, K, Q)
+        B_idx = QK8_1 * (A_qblock_num_in_K_direction * N_idx.expand_dims(1) + BLOCK_SIZE_K * k_stride_idx + tl.arange(0, BLOCK_SIZE_K)).expand_dims(2) + tl.arange(0, QK8_1)  # (N, K, Q)
         B = tl.load(B_ptr + B_idx, B_mask, other=0)  # (N, K, Q)
         # 量化B
         B_max = tl.max(tl.abs(B), 2)  # (N, K)
@@ -95,6 +94,7 @@ z
 
 
 QK8_0 = 32  # 每个量化块中的元素数量
+QK8_1 = 32
 Q8_0_SIZE = 34  # bytes
 
 
@@ -122,7 +122,7 @@ def mmq_q8_0(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> torch.
 
     # K方向的量化块数量
     assert (K % 32 == 0)
-    qblock_num_in_K_direction = int(K / 32)
+    A_qblock_num_in_K_direction = int(K / 32)
 
     # 创建输出张量
     C = torch.empty((N, M), device=A.device, dtype=torch.float16)
@@ -136,13 +136,12 @@ def mmq_q8_0(A: torch.Tensor, B: torch.Tensor, M: int, N: int, K: int) -> torch.
         C,
         M,
         N,
-        K,
-        qblock_num_in_K_direction,
-        QK8_0,
-        Q8_0_SIZE,
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
+        A_qblock_num_in_K_direction=A_qblock_num_in_K_direction,
+        Q8_0_SIZE=Q8_0_SIZE,
+        QK8_1=QK8_1,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
 
     return C
